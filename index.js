@@ -7,6 +7,11 @@ const PORT = Number(process.env.PORT || 3000);
 const SPREADSHEET_ID = process.env.GOOGLE_SPREADSHEET_ID || '';
 const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || '';
 const SHOPIFY_WEBHOOK_HMAC_SECRET = process.env.SHOPIFY_WEBHOOK_HMAC_SECRET || '';
+const SHOPIFY_STORE_DOMAIN = String(process.env.SHOPIFY_STORE_DOMAIN || '').replace(/^https?:\/\//, '').replace(/\/$/, '');
+const SHOPIFY_ADMIN_ACCESS_TOKEN = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN || '';
+const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || '2026-07';
+const ENABLE_SHOPIFY_INVENTORY_SYNC = String(process.env.ENABLE_SHOPIFY_INVENTORY_SYNC || '').toLowerCase() === 'true';
+const SYNC_INTERVAL_MS = Math.max(60000, Number(process.env.SYNC_INTERVAL_MS || 60000));
 
 app.use(express.json({
   limit: '2mb',
@@ -14,6 +19,16 @@ app.use(express.json({
 }));
 
 let sheetsClient;
+let reconcileRunning = false;
+
+function googleConfigured() {
+  return Boolean(process.env.GOOGLE_SERVICE_ACCOUNT_JSON || (process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL && process.env.GOOGLE_PRIVATE_KEY));
+}
+
+function shopifyApiConfigured() {
+  return Boolean(SHOPIFY_STORE_DOMAIN && SHOPIFY_ADMIN_ACCESS_TOKEN);
+}
+
 function getSheets() {
   if (sheetsClient) return sheetsClient;
   if (!SPREADSHEET_ID) throw new Error('GOOGLE_SPREADSHEET_ID is not configured');
@@ -56,6 +71,10 @@ function verifyWebhook(req) {
   return Boolean(WEBHOOK_TOKEN) && timingSafeEqualText(req.query.token, WEBHOOK_TOKEN);
 }
 
+function verifyAdminRequest(req) {
+  return Boolean(WEBHOOK_TOKEN) && timingSafeEqualText(req.query.token, WEBHOOK_TOKEN);
+}
+
 async function getValues(range) {
   const r = await getSheets().spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
@@ -72,6 +91,16 @@ async function updateValues(data) {
       valueInputOption: 'USER_ENTERED',
       data
     }
+  });
+}
+
+async function appendValues(range, values) {
+  await getSheets().spreadsheets.values.append({
+    spreadsheetId: SPREADSHEET_ID,
+    range,
+    valueInputOption: 'USER_ENTERED',
+    insertDataOption: 'INSERT_ROWS',
+    requestBody: { values }
   });
 }
 
@@ -110,6 +139,14 @@ function todayPacificDate() {
   return new Intl.DateTimeFormat('en-US', {
     timeZone: 'America/Los_Angeles',
     month: '2-digit', day: '2-digit', year: 'numeric'
+  }).format(new Date());
+}
+
+function nowPacific() {
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Los_Angeles',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true
   }).format(new Date());
 }
 
@@ -260,8 +297,196 @@ async function processFulfillment(payload) {
   return results;
 }
 
+async function shopifyGraphQL(query, variables = {}) {
+  if (!shopifyApiConfigured()) throw new Error('Shopify Admin API credentials are not configured');
+  const response = await fetch(`https://${SHOPIFY_STORE_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Shopify-Access-Token': SHOPIFY_ADMIN_ACCESS_TOKEN
+    },
+    body: JSON.stringify({ query, variables })
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(`Shopify Admin API HTTP ${response.status}: ${JSON.stringify(body)}`);
+  if (body.errors?.length) throw new Error(`Shopify GraphQL error: ${JSON.stringify(body.errors)}`);
+  return body.data;
+}
+
+const INVENTORY_READ_QUERY = `
+query InventoryItemsAtLocation($ids: [ID!]!, $locationId: ID!) {
+  nodes(ids: $ids) {
+    ... on InventoryItem {
+      id
+      sku
+      inventoryLevel(locationId: $locationId) {
+        quantities(names: ["available", "committed", "reserved", "on_hand"]) {
+          name
+          quantity
+        }
+      }
+    }
+  }
+}`;
+
+const INVENTORY_SET_MUTATION = `
+mutation SetInventoryAvailable($input: InventorySetQuantitiesInput!) {
+  inventorySetQuantities(input: $input) {
+    inventoryAdjustmentGroup {
+      reason
+      changes { name delta }
+    }
+    userErrors { field message code }
+  }
+}`;
+
+function quantityMap(level) {
+  const out = { available: 0, committed: 0, reserved: 0, on_hand: 0 };
+  for (const q of level?.quantities || []) out[q.name] = Number(q.quantity || 0);
+  return out;
+}
+
+async function appendSyncLog({ sku, eventKey = '', inventoryItemId, locationId, oldAvailable, targetAvailable, newAvailable, result, reason, reference = '' }) {
+  await appendValues("'SHOPIFY SYNC LOG'!A:L", [[
+    new Date().toISOString(), 'Sheet → Shopify', sku, eventKey, inventoryItemId, locationId,
+    oldAvailable, targetAvailable, newAvailable, result, reason, reference
+  ]]);
+}
+
+async function setShopifyAvailable({ sku, inventoryItemId, locationId, currentAvailable, targetAvailable }) {
+  const input = {
+    reason: 'correction',
+    name: 'available',
+    referenceDocumentUri: `gid://purebble-erp/InventorySync/${Date.now()}-${encodeURIComponent(sku)}`,
+    quantities: [{
+      inventoryItemId,
+      locationId,
+      quantity: targetAvailable,
+      changeFromQuantity: currentAvailable
+    }]
+  };
+  const data = await shopifyGraphQL(INVENTORY_SET_MUTATION, { input });
+  const result = data.inventorySetQuantities;
+  if (result?.userErrors?.length) {
+    throw new Error(result.userErrors.map(e => `${e.code || 'ERROR'}: ${e.message}`).join('; '));
+  }
+  return targetAvailable;
+}
+
+async function reconcileInventory({ allowWrites = false, source = 'Scheduled Reconcile' } = {}) {
+  if (reconcileRunning) return { skipped: true, reason: 'reconcile already running' };
+  reconcileRunning = true;
+  try {
+    if (!googleConfigured()) throw new Error('Google service-account credentials are not configured');
+    if (!shopifyApiConfigured()) throw new Error('Shopify Admin API credentials are not configured');
+
+    const rows = await getValues("'SHOPIFY SYNC'!A2:T100");
+    const mappings = rows.map((row, index) => ({
+      rowNumber: index + 2,
+      enabled: String(row[0] || '').trim() === 'Yes',
+      sku: String(row[1] || '').trim(),
+      physicalShelf: parseNumber(row[3]),
+      inventoryItemId: String(row[6] || '').trim(),
+      locationId: String(row[8] || '').trim(),
+      otherReserved: parseNumber(row[13])
+    })).filter(x => x.enabled && x.sku && x.inventoryItemId && x.locationId);
+
+    const groups = new Map();
+    for (const m of mappings) {
+      if (!groups.has(m.locationId)) groups.set(m.locationId, []);
+      groups.get(m.locationId).push(m);
+    }
+
+    const summary = { checked: 0, mismatches: 0, writes: 0, errors: [] };
+    const sheetWrites = [];
+
+    for (const [locationId, items] of groups.entries()) {
+      const data = await shopifyGraphQL(INVENTORY_READ_QUERY, {
+        ids: items.map(x => x.inventoryItemId),
+        locationId
+      });
+      const byId = new Map((data.nodes || []).filter(Boolean).map(node => [node.id, node]));
+
+      for (const m of items) {
+        summary.checked += 1;
+        const node = byId.get(m.inventoryItemId);
+        if (!node?.inventoryLevel) {
+          const msg = `No active inventory level at mapped location for ${m.sku}`;
+          summary.errors.push(msg);
+          sheetWrites.push({ range: `'SHOPIFY SYNC'!S${m.rowNumber}:T${m.rowNumber}`, values: [[nowPacific(), msg]] });
+          continue;
+        }
+
+        const q = quantityMap(node.inventoryLevel);
+        const target = Math.max(Math.trunc(m.physicalShelf - q.committed - q.reserved - m.otherReserved), 0);
+        const diff = target - q.available;
+        if (diff !== 0) summary.mismatches += 1;
+
+        let newAvailable = q.available;
+        let note = diff === 0 ? 'IN SYNC — fresh read' : `PENDING PUSH ${q.available} → ${target}`;
+
+        if (diff !== 0 && allowWrites) {
+          try {
+            newAvailable = await setShopifyAvailable({
+              sku: m.sku,
+              inventoryItemId: m.inventoryItemId,
+              locationId,
+              currentAvailable: q.available,
+              targetAvailable: target
+            });
+            summary.writes += 1;
+            note = `SYNCED ${q.available} → ${target}`;
+            await appendSyncLog({
+              sku: m.sku,
+              inventoryItemId: m.inventoryItemId,
+              locationId,
+              oldAvailable: q.available,
+              targetAvailable: target,
+              newAvailable,
+              result: 'SUCCESS',
+              reason: source,
+              reference: 'Railway auto reconcile'
+            });
+          } catch (err) {
+            const msg = String(err.message || err);
+            summary.errors.push(`${m.sku}: ${msg}`);
+            note = `BLOCKED: ${msg}`;
+            await appendSyncLog({
+              sku: m.sku,
+              inventoryItemId: m.inventoryItemId,
+              locationId,
+              oldAvailable: q.available,
+              targetAvailable: target,
+              newAvailable: q.available,
+              result: 'ERROR',
+              reason: msg,
+              reference: 'Railway auto reconcile'
+            });
+          }
+        }
+
+        sheetWrites.push(
+          { range: `'SHOPIFY SYNC'!J${m.rowNumber}:M${m.rowNumber}`, values: [[newAvailable, q.committed, q.reserved, q.on_hand]] },
+          { range: `'SHOPIFY SYNC'!S${m.rowNumber}:T${m.rowNumber}`, values: [[nowPacific(), note]] }
+        );
+      }
+    }
+
+    if (sheetWrites.length) await updateValues(sheetWrites);
+    return summary;
+  } finally {
+    reconcileRunning = false;
+  }
+}
+
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, service: 'purebble-shopify-inventory-runner', googleConfigured: Boolean(process.env.GOOGLE_SERVICE_ACCOUNT_JSON || process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL) });
+  res.json({
+    ok: true,
+    service: 'purebble-shopify-inventory-runner',
+    googleConfigured: googleConfigured(),
+    shopifyApiConfigured: shopifyApiConfigured(),
+    inventoryAutoSyncEnabled: ENABLE_SHOPIFY_INVENTORY_SYNC
+  });
 });
 
 app.post('/webhooks/shopify/fulfillments-create', async (req, res) => {
@@ -275,6 +500,27 @@ app.post('/webhooks/shopify/fulfillments-create', async (req, res) => {
   }
 });
 
+app.post('/admin/reconcile', async (req, res) => {
+  if (!verifyAdminRequest(req)) return res.status(401).json({ ok: false, error: 'unauthorized' });
+  try {
+    const allowWrites = req.body?.write === true;
+    const summary = await reconcileInventory({ allowWrites, source: allowWrites ? 'Manual Production Reconcile' : 'Manual Dry Run' });
+    res.status(200).json({ ok: true, allowWrites, summary });
+  } catch (err) {
+    console.error('inventory reconcile failed', err);
+    res.status(500).json({ ok: false, error: String(err.message || err) });
+  }
+});
+
 app.get('/', (_req, res) => res.json({ ok: true, name: 'PUREBBLE Shopify Inventory Runner' }));
 
-app.listen(PORT, '0.0.0.0', () => console.log(`PUREBBLE runner listening on ${PORT}`));
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`PUREBBLE runner listening on ${PORT}`);
+  if (ENABLE_SHOPIFY_INVENTORY_SYNC && googleConfigured() && shopifyApiConfigured()) {
+    console.log(`Inventory auto reconcile enabled every ${SYNC_INTERVAL_MS} ms`);
+    setTimeout(() => reconcileInventory({ allowWrites: true }).catch(err => console.error('initial reconcile failed', err)), 5000);
+    setInterval(() => reconcileInventory({ allowWrites: true }).catch(err => console.error('scheduled reconcile failed', err)), SYNC_INTERVAL_MS);
+  } else {
+    console.log('Inventory auto reconcile disabled until credentials and ENABLE_SHOPIFY_INVENTORY_SYNC=true are configured');
+  }
+});

@@ -3,6 +3,9 @@ import { spawn } from 'node:child_process';
 const SHOP = String(process.env.SHOPIFY_STORE_DOMAIN || '').replace(/^https?:\/\//, '').replace(/\/$/, '');
 const CLIENT_ID = process.env.SHOPIFY_CLIENT_ID || '';
 const CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET || '';
+const API_VERSION = process.env.SHOPIFY_API_VERSION || '2026-07';
+const PUBLIC_HOST = String(process.env.RAILWAY_PUBLIC_DOMAIN || 'purebble-webhook-prod-production.up.railway.app').replace(/^https?:\/\//, '').replace(/\/$/, '');
+const WEBHOOK_URI = `https://${PUBLIC_HOST}/webhooks/shopify/fulfillments-create`;
 const REFRESH_MS = 23 * 60 * 60 * 1000;
 
 let child = null;
@@ -38,11 +41,73 @@ async function getAccessToken() {
   return body.access_token;
 }
 
+async function graphql(accessToken, query, variables = {}) {
+  const response = await fetch(`https://${SHOP}/admin/api/${API_VERSION}/graphql.json`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Shopify-Access-Token': accessToken
+    },
+    body: JSON.stringify({ query, variables })
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(`Shopify GraphQL HTTP ${response.status}: ${JSON.stringify(body)}`);
+  if (body.errors?.length) throw new Error(`Shopify GraphQL errors: ${JSON.stringify(body.errors)}`);
+  return body.data;
+}
+
+async function ensureFulfillmentWebhook(accessToken) {
+  const listQuery = `
+    query PurebbleWebhookSubscriptions($topics: [WebhookSubscriptionTopic!]) {
+      webhookSubscriptions(first: 50, topics: $topics) {
+        nodes { id topic uri format }
+      }
+    }
+  `;
+  const listed = await graphql(accessToken, listQuery, { topics: ['FULFILLMENTS_CREATE'] });
+  const nodes = listed?.webhookSubscriptions?.nodes || [];
+  const exact = nodes.find(x => x.topic === 'FULFILLMENTS_CREATE' && x.uri === WEBHOOK_URI);
+  if (exact) {
+    console.log(`WEBHOOK_VERIFY OK existing id=${exact.id} topic=${exact.topic} uri=${exact.uri}`);
+    return exact;
+  }
+
+  const createMutation = `
+    mutation CreatePurebbleFulfillmentWebhook($topic: WebhookSubscriptionTopic!, $webhookSubscription: WebhookSubscriptionInput!) {
+      webhookSubscriptionCreate(topic: $topic, webhookSubscription: $webhookSubscription) {
+        webhookSubscription { id topic uri format }
+        userErrors { field message }
+      }
+    }
+  `;
+  const created = await graphql(accessToken, createMutation, {
+    topic: 'FULFILLMENTS_CREATE',
+    webhookSubscription: { uri: WEBHOOK_URI, format: 'JSON' }
+  });
+  const result = created?.webhookSubscriptionCreate;
+  if (result?.userErrors?.length) {
+    throw new Error(`Webhook create failed: ${result.userErrors.map(e => `${e.field || ''}: ${e.message}`).join('; ')}`);
+  }
+  if (!result?.webhookSubscription?.id) throw new Error('Webhook create returned no subscription');
+  console.log(`WEBHOOK_CREATE OK id=${result.webhookSubscription.id} topic=${result.webhookSubscription.topic} uri=${result.webhookSubscription.uri}`);
+
+  const verify = await graphql(accessToken, listQuery, { topics: ['FULFILLMENTS_CREATE'] });
+  const verified = (verify?.webhookSubscriptions?.nodes || []).find(x => x.id === result.webhookSubscription.id && x.uri === WEBHOOK_URI);
+  if (!verified) throw new Error('Webhook verification failed after create');
+  console.log(`WEBHOOK_VERIFY OK created id=${verified.id} topic=${verified.topic} uri=${verified.uri}`);
+  return verified;
+}
+
 async function startRunner() {
   const accessToken = await getAccessToken();
+  await ensureFulfillmentWebhook(accessToken);
   child = spawn(process.execPath, ['index.js'], {
     stdio: 'inherit',
-    env: { ...process.env, SHOPIFY_ADMIN_ACCESS_TOKEN: accessToken }
+    env: {
+      ...process.env,
+      SHOPIFY_ADMIN_ACCESS_TOKEN: accessToken,
+      SHOPIFY_WEBHOOK_HMAC_SECRET: CLIENT_SECRET
+    }
   });
 
   child.on('exit', (code, signal) => {

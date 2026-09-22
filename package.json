@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "engines": { "node": ">=20" },
-  "scripts": { "start": "node start-client-credentials.js" },
+  "scripts": { "start": "node dry-run-once.js && node start-client-credentials.js" },
   "dependencies": {
     "express": "^5.1.0",
     "googleapis": "^159.0.0"

@@ -1,0 +1,12 @@
+{
+  "name": "purebble-shopify-inventory-runner",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": { "start": "node index.js" },
+  "dependencies": {
+    "express": "^5.1.0",
+    "googleapis": "^159.0.0"
+  }
+}

@@ -5,7 +5,12 @@ const CLIENT_ID = process.env.SHOPIFY_CLIENT_ID || '';
 const CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET || '';
 const API_VERSION = process.env.SHOPIFY_API_VERSION || '2026-07';
 const PUBLIC_HOST = String(process.env.RAILWAY_PUBLIC_DOMAIN || 'purebble-webhook-prod-production.up.railway.app').replace(/^https?:\/\//, '').replace(/\/$/, '');
-const WEBHOOK_URI = `https://${PUBLIC_HOST}/webhooks/shopify/fulfillments-create`;
+const WEBHOOKS = [
+  { topic: 'FULFILLMENTS_CREATE', path: '/webhooks/shopify/fulfillments-create' },
+  { topic: 'ORDERS_CREATE', path: '/webhooks/shopify/orders-create' },
+  { topic: 'ORDERS_CANCELLED', path: '/webhooks/shopify/orders-cancelled' },
+  { topic: 'REFUNDS_CREATE', path: '/webhooks/shopify/refunds-create' }
+].map(x => ({ ...x, uri: `https://${PUBLIC_HOST}${x.path}` }));
 const REFRESH_MS = 23 * 60 * 60 * 1000;
 
 let child = null;
@@ -56,51 +61,57 @@ async function graphql(accessToken, query, variables = {}) {
   return body.data;
 }
 
-async function ensureFulfillmentWebhook(accessToken) {
+async function ensureLifecycleWebhooks(accessToken) {
   const listQuery = `
     query PurebbleWebhookSubscriptions($topics: [WebhookSubscriptionTopic!]) {
-      webhookSubscriptions(first: 50, topics: $topics) {
+      webhookSubscriptions(first: 100, topics: $topics) {
         nodes { id topic uri format }
       }
     }
   `;
-  const listed = await graphql(accessToken, listQuery, { topics: ['FULFILLMENTS_CREATE'] });
-  const nodes = listed?.webhookSubscriptions?.nodes || [];
-  const exact = nodes.find(x => x.topic === 'FULFILLMENTS_CREATE' && x.uri === WEBHOOK_URI);
-  if (exact) {
-    console.log(`WEBHOOK_VERIFY OK existing id=${exact.id} topic=${exact.topic} uri=${exact.uri}`);
-    return exact;
-  }
 
   const createMutation = `
-    mutation CreatePurebbleFulfillmentWebhook($topic: WebhookSubscriptionTopic!, $webhookSubscription: WebhookSubscriptionInput!) {
+    mutation CreatePurebbleWebhook($topic: WebhookSubscriptionTopic!, $webhookSubscription: WebhookSubscriptionInput!) {
       webhookSubscriptionCreate(topic: $topic, webhookSubscription: $webhookSubscription) {
         webhookSubscription { id topic uri format }
         userErrors { field message }
       }
     }
   `;
-  const created = await graphql(accessToken, createMutation, {
-    topic: 'FULFILLMENTS_CREATE',
-    webhookSubscription: { uri: WEBHOOK_URI, format: 'JSON' }
-  });
-  const result = created?.webhookSubscriptionCreate;
-  if (result?.userErrors?.length) {
-    throw new Error(`Webhook create failed: ${result.userErrors.map(e => `${e.field || ''}: ${e.message}`).join('; ')}`);
-  }
-  if (!result?.webhookSubscription?.id) throw new Error('Webhook create returned no subscription');
-  console.log(`WEBHOOK_CREATE OK id=${result.webhookSubscription.id} topic=${result.webhookSubscription.topic} uri=${result.webhookSubscription.uri}`);
 
-  const verify = await graphql(accessToken, listQuery, { topics: ['FULFILLMENTS_CREATE'] });
-  const verified = (verify?.webhookSubscriptions?.nodes || []).find(x => x.id === result.webhookSubscription.id && x.uri === WEBHOOK_URI);
-  if (!verified) throw new Error('Webhook verification failed after create');
-  console.log(`WEBHOOK_VERIFY OK created id=${verified.id} topic=${verified.topic} uri=${verified.uri}`);
-  return verified;
+  const topics = WEBHOOKS.map(x => x.topic);
+  let listed = await graphql(accessToken, listQuery, { topics });
+  let nodes = listed?.webhookSubscriptions?.nodes || [];
+
+  for (const target of WEBHOOKS) {
+    const exact = nodes.find(x => x.topic === target.topic && x.uri === target.uri);
+    if (exact) {
+      console.log(`WEBHOOK_VERIFY OK existing id=${exact.id} topic=${exact.topic} uri=${exact.uri}`);
+      continue;
+    }
+
+    const created = await graphql(accessToken, createMutation, {
+      topic: target.topic,
+      webhookSubscription: { uri: target.uri, format: 'JSON' }
+    });
+    const result = created?.webhookSubscriptionCreate;
+    if (result?.userErrors?.length) {
+      throw new Error(`Webhook create failed for ${target.topic}: ${result.userErrors.map(e => `${e.field || ''}: ${e.message}`).join('; ')}`);
+    }
+    if (!result?.webhookSubscription?.id) throw new Error(`Webhook create returned no subscription for ${target.topic}`);
+    console.log(`WEBHOOK_CREATE OK id=${result.webhookSubscription.id} topic=${result.webhookSubscription.topic} uri=${result.webhookSubscription.uri}`);
+
+    listed = await graphql(accessToken, listQuery, { topics });
+    nodes = listed?.webhookSubscriptions?.nodes || [];
+    const verified = nodes.find(x => x.id === result.webhookSubscription.id && x.uri === target.uri);
+    if (!verified) throw new Error(`Webhook verification failed after create for ${target.topic}`);
+    console.log(`WEBHOOK_VERIFY OK created id=${verified.id} topic=${verified.topic} uri=${verified.uri}`);
+  }
 }
 
 async function startRunner() {
   const accessToken = await getAccessToken();
-  await ensureFulfillmentWebhook(accessToken);
+  await ensureLifecycleWebhooks(accessToken);
   child = spawn(process.execPath, ['index.js'], {
     stdio: 'inherit',
     env: {

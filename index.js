@@ -207,14 +207,15 @@ function allocateFefo(lots, qty) {
   return allocations;
 }
 
-async function queueAlreadyHas(baseEventKey) {
-  const rows = await getValues("'SHOPIFY FULFILLMENT QUEUE'!I2:I1000");
-  return rows.some(r => String(r[0] || '') === baseEventKey);
-}
-
 async function orderEventAlreadyHas(eventKey) {
   const rows = await getValues("'SHOPIFY ORDER EVENTS'!Q2:Q2000");
   return rows.some(r => String(r[0] || '').trim() === String(eventKey || '').trim());
+}
+
+async function shipmentAlreadyHas(baseEventKey) {
+  const rows = await getValues("'Channel Shipments'!V2:V1000");
+  const prefix = `${String(baseEventKey || '').trim()}|S`;
+  return rows.some(r => String(r[0] || '').trim().startsWith(prefix));
 }
 
 function upperText(value) {
@@ -422,15 +423,6 @@ async function processRefund(payload) {
   return { refundGid, newlyLoggedQty, events, orderRow: row };
 }
 
-async function appendQueue({ orderRef, orderGid, fulfillmentGid, lineItemGid, sku, qty, createdAt, source }) {
-  const row = await nextEmptyRow('SHOPIFY FULFILLMENT QUEUE', 'A', 1000);
-  await updateValues([
-    { range: `'SHOPIFY FULFILLMENT QUEUE'!A${row}:H${row}`, values: [[new Date().toISOString(), orderRef, orderGid, fulfillmentGid, lineItemGid, sku, qty, createdAt || new Date().toISOString()]] },
-    { range: `'SHOPIFY FULFILLMENT QUEUE'!P${row}:P${row}`, values: [[source]] }
-  ]);
-  return row;
-}
-
 function shipmentReviewKey({ shipDate, orderRef, sku, qty, expiry, eventKey }) {
   return `${yyyymmdd(shipDate)}|Shopify|${orderRef}|${sku}|Q${qty}|${yyyymmdd(expiry)}|${eventKey}`;
 }
@@ -483,39 +475,53 @@ async function processFulfillment(payload) {
 
     const lineItemGid = `gid://shopify/LineItem/${lineItemId}`;
     const baseEventKey = `${fulfillmentGid}|${lineItemGid}`;
-    if (await queueAlreadyHas(baseEventKey)) {
-      results.push({ baseEventKey, status: 'duplicate_ignored' });
-      continue;
-    }
+    const lifecycleEventKey = `FULFILLMENTS_CREATE|${baseEventKey}`;
 
     const sku = await getErpSkuForVariant(item.variant_id, item.sku);
     if (!sku) throw new Error(`No ERP SKU mapping for Shopify line item ${lineItemId}`);
 
-    const queueRow = await appendQueue({
-      orderRef, orderGid, fulfillmentGid, lineItemGid, sku, qty,
-      createdAt: payload.created_at || new Date().toISOString(), source
+    const shipmentExists = await shipmentAlreadyHas(baseEventKey);
+    const eventExists = await orderEventAlreadyHas(lifecycleEventKey);
+
+    if (shipmentExists) {
+      if (!eventExists) {
+        await appendOrderEvent({
+          eventAt, eventType: 'FULFILLMENTS_CREATE', orderRef, orderGid,
+          fulfillmentGid, fulfillmentLineItemGid: lineItemGid, shopifyLineItemGid: lineItemGid,
+          sku, qty, inventoryEffect: 'DEDUCT', shelfDelta: -qty,
+          reason: 'Recovered lifecycle log from existing posted shipment',
+          shopifyObjectGid: fulfillmentGid,
+          eventKey: lifecycleEventKey,
+          processStatus: 'DONE',
+          related: 'Existing Channel Shipments record',
+          notes: 'No additional Shelf deduction; shipment had already been posted.'
+        });
+      }
+      results.push({ baseEventKey, sku, qty, status: 'duplicate_ignored_existing_shipment' });
+      continue;
+    }
+
+    if (eventExists && !shipmentExists) {
+      throw new Error(`Lifecycle event exists without posted shipment for ${baseEventKey}; manual review required`);
+    }
+
+    const segments = await appendShipmentSegments({
+      orderRef, orderGid, fulfillmentGid, lineItemGid, sku, qty, shipDate, source
     });
 
-    try {
-      const segments = await appendShipmentSegments({
-        orderRef, orderGid, fulfillmentGid, lineItemGid, sku, qty, shipDate, source
-      });
-      const lifecycleEvent = await appendOrderEvent({
-        eventAt, eventType: 'FULFILLMENTS_CREATE', orderRef, orderGid,
-        fulfillmentGid, fulfillmentLineItemGid: lineItemGid, shopifyLineItemGid: lineItemGid,
-        sku, qty, inventoryEffect: 'DEDUCT', shelfDelta: -qty,
-        reason: 'Actual fulfillment posted to Shelf inventory',
-        shopifyObjectGid: fulfillmentGid,
-        eventKey: `FULFILLMENTS_CREATE|${baseEventKey}`,
-        processStatus: 'DONE',
-        related: `Fulfillment Queue row ${queueRow}; ${segments} FEFO shipment segment(s)`
-      });
-      postedQty += qty;
-      results.push({ baseEventKey, sku, qty, queueRow, segments, lifecycleEvent, status: 'posted' });
-    } catch (err) {
-      await updateValues([{ range: `'SHOPIFY FULFILLMENT QUEUE'!N${queueRow}:N${queueRow}`, values: [[String(err.message || err)]] }]);
-      throw err;
-    }
+    const lifecycleEvent = await appendOrderEvent({
+      eventAt, eventType: 'FULFILLMENTS_CREATE', orderRef, orderGid,
+      fulfillmentGid, fulfillmentLineItemGid: lineItemGid, shopifyLineItemGid: lineItemGid,
+      sku, qty, inventoryEffect: 'DEDUCT', shelfDelta: -qty,
+      reason: 'Actual fulfillment posted to Shelf inventory',
+      shopifyObjectGid: fulfillmentGid,
+      eventKey: lifecycleEventKey,
+      processStatus: 'DONE',
+      related: `${segments} FEFO shipment segment(s)`
+    });
+
+    postedQty += qty;
+    results.push({ baseEventKey, sku, qty, segments, lifecycleEvent, status: 'posted' });
   }
 
   if (postedQty > 0) {

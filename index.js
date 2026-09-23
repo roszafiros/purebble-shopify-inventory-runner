@@ -610,11 +610,11 @@ query InventoryItemsAtLocation($ids: [ID!]!, $locationId: ID!) {
 }`;
 
 const INVENTORY_SET_MUTATION = `
-mutation SetInventoryAvailable($input: InventorySetQuantitiesInput!) {
-  inventorySetQuantities(input: $input) {
+mutation SetInventoryAvailable($input: InventorySetQuantitiesInput!, $idempotencyKey: String!) {
+  inventorySetQuantities(input: $input) @idempotent(key: $idempotencyKey) {
     inventoryAdjustmentGroup {
       reason
-      changes { name delta }
+      changes { name delta quantityAfterChange }
     }
     userErrors { field message code }
   }
@@ -645,7 +645,8 @@ async function setShopifyAvailable({ sku, inventoryItemId, locationId, currentAv
       changeFromQuantity: currentAvailable
     }]
   };
-  const data = await shopifyGraphQL(INVENTORY_SET_MUTATION, { input });
+  const idempotencyKey = crypto.randomUUID();
+  const data = await shopifyGraphQL(INVENTORY_SET_MUTATION, { input, idempotencyKey });
   const result = data.inventorySetQuantities;
   if (result?.userErrors?.length) {
     throw new Error(result.userErrors.map(e => `${e.code || 'ERROR'}: ${e.message}`).join('; '));

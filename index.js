@@ -212,6 +212,216 @@ async function queueAlreadyHas(baseEventKey) {
   return rows.some(r => String(r[0] || '') === baseEventKey);
 }
 
+async function orderEventAlreadyHas(eventKey) {
+  const rows = await getValues("'SHOPIFY ORDER EVENTS'!Q2:Q2000");
+  return rows.some(r => String(r[0] || '').trim() === String(eventKey || '').trim());
+}
+
+function upperText(value) {
+  return value ? String(value).trim().toUpperCase() : '';
+}
+
+function orderGidFromId(id) {
+  return id ? `gid://shopify/Order/${id}` : '';
+}
+
+function objectGid(type, id) {
+  return id ? `gid://shopify/${type}/${id}` : '';
+}
+
+async function findOrderRow(orderGid) {
+  if (!orderGid) return null;
+  const rows = await getValues("'SHOPIFY ORDERS'!C2:C1000");
+  for (let i = 0; i < rows.length; i++) {
+    if (String(rows[i]?.[0] || '').trim() === orderGid) return i + 2;
+  }
+  return null;
+}
+
+async function ensureOrderSummary(payload, { orderGid = '', orderRef = '' } = {}) {
+  const gid = orderGid || orderGidFromId(payload?.id || payload?.order_id);
+  if (!gid) throw new Error('Cannot resolve Order GID for lifecycle summary');
+  let row = await findOrderRow(gid);
+  const eventAt = payload?.created_at || payload?.updated_at || new Date().toISOString();
+  const ref = orderRef || payload?.name || (payload?.order_number ? `#${payload.order_number}` : `Order ${payload?.id || payload?.order_id || ''}`);
+  const financial = upperText(payload?.financial_status);
+  const fulfillment = upperText(payload?.fulfillment_status);
+  const lineCount = Array.isArray(payload?.line_items) ? payload.line_items.length : '';
+  const total = payload?.current_total_price ?? payload?.total_price ?? '';
+  const currency = payload?.currency || '';
+
+  if (!row) {
+    row = await nextEmptyRow('SHOPIFY ORDERS', 'A', 1000);
+    await updateValues([{
+      range: `'SHOPIFY ORDERS'!A${row}:L${row}`,
+      values: [[eventAt, ref, gid, financial, fulfillment, lineCount, total, currency, 'LIVE', nowPacific(), 'LIVE — EVENT TRACKED', 'Created by Shopify lifecycle automation']]
+    }]);
+  } else {
+    const writes = [{ range: `'SHOPIFY ORDERS'!J${row}:J${row}`, values: [[nowPacific()]] }];
+    if (financial) writes.push({ range: `'SHOPIFY ORDERS'!D${row}:D${row}`, values: [[financial]] });
+    if (fulfillment) writes.push({ range: `'SHOPIFY ORDERS'!E${row}:E${row}`, values: [[fulfillment]] });
+    await updateValues(writes);
+  }
+  return row;
+}
+
+async function getOrderLifecycle(row) {
+  const values = await getValues(`'SHOPIFY ORDERS'!P${row}:X${row}`);
+  const r = values[0] || [];
+  return {
+    fulfilled: parseNumber(r[0]),
+    refunded: parseNumber(r[1]),
+    returned: parseNumber(r[2]),
+    restocked: parseNumber(r[3]),
+    inventoryImpact: String(r[4] || ''),
+    lastEventAt: String(r[5] || ''),
+    lastEventType: String(r[6] || ''),
+    lifecycleStatus: String(r[7] || ''),
+    reconciliation: String(r[8] || '')
+  };
+}
+
+async function updateOrderLifecycle(row, patch = {}) {
+  const col = {
+    cancelledAt: 'M', cancelReason: 'N', cancellationStatus: 'O',
+    fulfilled: 'P', refunded: 'Q', returned: 'R', restocked: 'S',
+    inventoryImpact: 'T', lastEventAt: 'U', lastEventType: 'V',
+    lifecycleStatus: 'W', reconciliation: 'X'
+  };
+  const writes = [];
+  for (const [key, value] of Object.entries(patch)) {
+    if (!(key in col) || value === undefined) continue;
+    writes.push({ range: `'SHOPIFY ORDERS'!${col[key]}${row}:${col[key]}${row}`, values: [[value]] });
+  }
+  if (writes.length) await updateValues(writes);
+}
+
+async function appendOrderEvent({
+  eventAt = new Date().toISOString(), eventType, orderRef = '', orderGid = '',
+  financialStatus = '', fulfillmentStatus = '', fulfillmentGid = '',
+  fulfillmentLineItemGid = '', shopifyLineItemGid = '', sku = '', qty = 0,
+  inventoryEffect = 'NONE', shelfDelta = 0, reason = '', shopifyObjectGid = '',
+  source = 'Shopify Webhook', eventKey, processStatus = 'DONE',
+  related = '', notes = ''
+}) {
+  if (!eventKey) throw new Error('Order event is missing Event Key');
+  if (await orderEventAlreadyHas(eventKey)) return { status: 'duplicate_ignored', eventKey };
+  const row = await nextEmptyRow('SHOPIFY ORDER EVENTS', 'A', 2000);
+  await updateValues([
+    {
+      range: `'SHOPIFY ORDER EVENTS'!A${row}:Q${row}`,
+      values: [[eventAt, eventType, orderRef, orderGid, financialStatus, fulfillmentStatus,
+        fulfillmentGid, fulfillmentLineItemGid, shopifyLineItemGid, sku, qty,
+        inventoryEffect, shelfDelta, reason, shopifyObjectGid, source, eventKey]]
+    },
+    {
+      range: `'SHOPIFY ORDER EVENTS'!S${row}:V${row}`,
+      values: [[processStatus, related, new Date().toISOString(), notes]]
+    }
+  ]);
+  return { status: 'logged', eventKey, row };
+}
+
+async function processOrderCreated(payload) {
+  if (!payload?.id) throw new Error('Order create webhook missing id');
+  const orderGid = orderGidFromId(payload.id);
+  const orderRef = payload.name || (payload.order_number ? `#${payload.order_number}` : `Order ${payload.id}`);
+  const eventKey = `ORDERS_CREATE|${orderGid}`;
+  const eventAt = payload.created_at || new Date().toISOString();
+  const logged = await appendOrderEvent({
+    eventAt, eventType: 'ORDERS_CREATE', orderRef, orderGid,
+    financialStatus: upperText(payload.financial_status),
+    fulfillmentStatus: upperText(payload.fulfillment_status),
+    qty: 0, inventoryEffect: 'NONE', shelfDelta: 0,
+    reason: 'Order created — no Shelf movement',
+    shopifyObjectGid: orderGid, eventKey, processStatus: 'DONE'
+  });
+  if (logged.status === 'duplicate_ignored') return logged;
+  const row = await ensureOrderSummary(payload, { orderGid, orderRef });
+  await updateOrderLifecycle(row, {
+    inventoryImpact: 'NONE — ORDER CREATION ONLY',
+    lastEventAt: eventAt, lastEventType: 'ORDERS_CREATE',
+    lifecycleStatus: 'OPEN', reconciliation: 'RECONCILED'
+  });
+  return { ...logged, orderRow: row };
+}
+
+async function processOrderCancelled(payload) {
+  if (!payload?.id) throw new Error('Order cancelled webhook missing id');
+  const orderGid = orderGidFromId(payload.id);
+  const orderRef = payload.name || (payload.order_number ? `#${payload.order_number}` : `Order ${payload.id}`);
+  const eventAt = payload.cancelled_at || payload.updated_at || new Date().toISOString();
+  const reason = String(payload.cancel_reason || payload.cancel_reason_label || 'Order cancelled');
+  const eventKey = `ORDERS_CANCELLED|${orderGid}`;
+
+  const logged = await appendOrderEvent({
+    eventAt, eventType: 'ORDERS_CANCELLED', orderRef, orderGid,
+    financialStatus: upperText(payload.financial_status),
+    fulfillmentStatus: upperText(payload.fulfillment_status),
+    qty: 0, inventoryEffect: 'NONE', shelfDelta: 0, reason,
+    shopifyObjectGid: orderGid, eventKey, processStatus: 'DONE',
+    notes: 'Cancellation never auto-restocks Shelf. Fulfilled quantities remain deducted until a physical return is confirmed.'
+  });
+  if (logged.status === 'duplicate_ignored') return logged;
+
+  const row = await ensureOrderSummary(payload, { orderGid, orderRef });
+  const life = await getOrderLifecycle(row);
+  const impact = life.fulfilled > 0
+    ? 'NO AUTO RESTOCK — FULFILLED QTY REMAINS DEDUCTED'
+    : 'NO SHELF CHANGE — CANCELLED BEFORE FULFILLMENT';
+  await updateOrderLifecycle(row, {
+    cancelledAt: eventAt, cancelReason: reason, cancellationStatus: 'CANCELLED',
+    inventoryImpact: impact, lastEventAt: eventAt, lastEventType: 'ORDERS_CANCELLED',
+    lifecycleStatus: life.fulfilled > 0 ? 'CANCELLED AFTER FULFILLMENT' : 'CANCELLED',
+    reconciliation: 'RECONCILED'
+  });
+  return { ...logged, orderRow: row, inventoryImpact: impact };
+}
+
+async function processRefund(payload) {
+  if (!payload?.id || !payload?.order_id) throw new Error('Refund webhook missing id/order_id');
+  const refundGid = objectGid('Refund', payload.id);
+  const orderGid = orderGidFromId(payload.order_id);
+  const orderRef = payload.order_name || `Order ${payload.order_id}`;
+  const eventAt = payload.created_at || new Date().toISOString();
+  const refundLines = Array.isArray(payload.refund_line_items) && payload.refund_line_items.length
+    ? payload.refund_line_items : [null];
+  let newlyLoggedQty = 0;
+  const events = [];
+
+  for (const refundLine of refundLines) {
+    const lineItem = refundLine?.line_item || {};
+    const lineItemId = refundLine?.line_item_id || lineItem?.id || '';
+    const lineItemGid = lineItemId ? objectGid('LineItem', lineItemId) : '';
+    const qty = refundLine ? parseNumber(refundLine.quantity) : 0;
+    const sku = refundLine ? await getErpSkuForVariant(lineItem.variant_id, lineItem.sku) : '';
+    const eventKey = `REFUNDS_CREATE|${refundGid}|${lineItemGid || 'ALL'}`;
+    const restockType = refundLine?.restock_type ? `restock_type=${refundLine.restock_type}` : '';
+    const logged = await appendOrderEvent({
+      eventAt, eventType: 'REFUNDS_CREATE', orderRef, orderGid,
+      shopifyLineItemGid: lineItemGid, sku, qty,
+      inventoryEffect: 'NONE', shelfDelta: 0,
+      reason: [payload.note || 'Refund recorded', restockType].filter(Boolean).join(' | '),
+      shopifyObjectGid: refundGid, eventKey, processStatus: 'DONE',
+      notes: 'Refund is financial/accounting history only. Shelf stock is not restored until physical return confirmation.'
+    });
+    events.push(logged);
+    if (logged.status === 'logged') newlyLoggedQty += qty;
+  }
+
+  const row = await ensureOrderSummary({ ...payload, id: payload.order_id }, { orderGid, orderRef });
+  const life = await getOrderLifecycle(row);
+  const refunded = life.refunded + newlyLoggedQty;
+  await updateOrderLifecycle(row, {
+    refunded,
+    inventoryImpact: 'NO AUTO RESTOCK — PHYSICAL RETURN REQUIRED',
+    lastEventAt: eventAt, lastEventType: 'REFUNDS_CREATE',
+    lifecycleStatus: life.fulfilled > 0 && refunded >= life.fulfilled ? 'REFUNDED' : 'REFUND RECORDED',
+    reconciliation: 'RECONCILED'
+  });
+  return { refundGid, newlyLoggedQty, events, orderRow: row };
+}
+
 async function appendQueue({ orderRef, orderGid, fulfillmentGid, lineItemGid, sku, qty, createdAt, source }) {
   const row = await nextEmptyRow('SHOPIFY FULFILLMENT QUEUE', 'A', 1000);
   await updateValues([
@@ -261,8 +471,10 @@ async function processFulfillment(payload) {
   const orderGid = `gid://shopify/Order/${payload.order_id}`;
   const orderRef = payload.name || `Order ${payload.order_id}`;
   const shipDate = mmddyyyy(payload.created_at || payload.updated_at || todayPacificDate());
+  const eventAt = payload.created_at || new Date().toISOString();
   const source = 'Shopify Webhook';
   const results = [];
+  let postedQty = 0;
 
   for (const item of payload.line_items || []) {
     const lineItemId = item.id;
@@ -288,11 +500,35 @@ async function processFulfillment(payload) {
       const segments = await appendShipmentSegments({
         orderRef, orderGid, fulfillmentGid, lineItemGid, sku, qty, shipDate, source
       });
-      results.push({ baseEventKey, sku, qty, queueRow, segments, status: 'posted' });
+      const lifecycleEvent = await appendOrderEvent({
+        eventAt, eventType: 'FULFILLMENTS_CREATE', orderRef, orderGid,
+        fulfillmentGid, fulfillmentLineItemGid: lineItemGid, shopifyLineItemGid: lineItemGid,
+        sku, qty, inventoryEffect: 'DEDUCT', shelfDelta: -qty,
+        reason: 'Actual fulfillment posted to Shelf inventory',
+        shopifyObjectGid: fulfillmentGid,
+        eventKey: `FULFILLMENTS_CREATE|${baseEventKey}`,
+        processStatus: 'DONE',
+        related: `Fulfillment Queue row ${queueRow}; ${segments} FEFO shipment segment(s)`
+      });
+      postedQty += qty;
+      results.push({ baseEventKey, sku, qty, queueRow, segments, lifecycleEvent, status: 'posted' });
     } catch (err) {
       await updateValues([{ range: `'SHOPIFY FULFILLMENT QUEUE'!N${queueRow}:N${queueRow}`, values: [[String(err.message || err)]] }]);
       throw err;
     }
+  }
+
+  if (postedQty > 0) {
+    const row = await ensureOrderSummary(payload, { orderGid, orderRef });
+    const life = await getOrderLifecycle(row);
+    await updateOrderLifecycle(row, {
+      fulfilled: life.fulfilled + postedQty,
+      inventoryImpact: 'SHELF DEDUCTED ON FULFILLMENT',
+      lastEventAt: eventAt,
+      lastEventType: 'FULFILLMENTS_CREATE',
+      lifecycleStatus: 'FULFILLMENT POSTED',
+      reconciliation: 'RECONCILED'
+    });
   }
   return results;
 }
@@ -496,6 +732,39 @@ app.post('/webhooks/shopify/fulfillments-create', async (req, res) => {
     res.status(200).json({ ok: true, results });
   } catch (err) {
     console.error('fulfillment processing failed', err);
+    res.status(500).json({ ok: false, error: String(err.message || err) });
+  }
+});
+
+app.post('/webhooks/shopify/orders-create', async (req, res) => {
+  if (!verifyWebhook(req)) return res.status(401).json({ ok: false, error: 'unauthorized' });
+  try {
+    const result = await processOrderCreated(req.body);
+    res.status(200).json({ ok: true, result });
+  } catch (err) {
+    console.error('order create processing failed', err);
+    res.status(500).json({ ok: false, error: String(err.message || err) });
+  }
+});
+
+app.post('/webhooks/shopify/orders-cancelled', async (req, res) => {
+  if (!verifyWebhook(req)) return res.status(401).json({ ok: false, error: 'unauthorized' });
+  try {
+    const result = await processOrderCancelled(req.body);
+    res.status(200).json({ ok: true, result });
+  } catch (err) {
+    console.error('order cancellation processing failed', err);
+    res.status(500).json({ ok: false, error: String(err.message || err) });
+  }
+});
+
+app.post('/webhooks/shopify/refunds-create', async (req, res) => {
+  if (!verifyWebhook(req)) return res.status(401).json({ ok: false, error: 'unauthorized' });
+  try {
+    const result = await processRefund(req.body);
+    res.status(200).json({ ok: true, result });
+  } catch (err) {
+    console.error('refund processing failed', err);
     res.status(500).json({ ok: false, error: String(err.message || err) });
   }
 });

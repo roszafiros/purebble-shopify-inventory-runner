@@ -158,6 +158,44 @@ async function nextEmptyRow(sheetName, column = 'A', maxRow = 1000) {
   throw new Error(`${sheetName} has no empty rows before ${maxRow}`);
 }
 
+async function syncApprovalMetadata() {
+  if (!googleConfigured()) return { checked: 0, updated: 0 };
+
+  const rows = await getValues("'CHANGE REQUEST'!D2:U500");
+  const writes = [];
+  let checked = 0;
+
+  for (let i = 0; i < rows.length; i++) {
+    const rowNumber = i + 2;
+    const row = rows[i] || [];
+    const sku = String(row[0] || '').trim();
+    if (!sku) continue;
+
+    checked += 1;
+    const approvedBy = String(row[7] || '').trim();      // K
+    const approvalDate = String(row[8] || '').trim();   // L
+    const decision = String(row[15] || '').trim();      // S
+    const reviewKey = String(row[16] || '').trim();     // T
+    const finalKey = String(row[17] || '').trim();      // U
+
+    if (decision !== 'Approved') continue;
+
+    if (!approvedBy) {
+      writes.push({ range: `'CHANGE REQUEST'!K${rowNumber}`, values: [['Jean']] });
+    }
+    if (!approvalDate) {
+      writes.push({ range: `'CHANGE REQUEST'!L${rowNumber}`, values: [[todayPacificDate()]] });
+    }
+    if (reviewKey && !finalKey) {
+      writes.push({ range: `'CHANGE REQUEST'!U${rowNumber}`, values: [[reviewKey]] });
+    }
+  }
+
+  if (writes.length) await updateValues(writes);
+  if (writes.length) console.log(`Approval metadata auto-filled: ${writes.length} cell(s)`);
+  return { checked, updated: writes.length };
+}
+
 async function getErpSkuForVariant(variantId, fallbackSku) {
   const rows = await getValues("'SHOPIFY SYNC'!B2:F37");
   const variantGid = variantId ? `gid://shopify/ProductVariant/${variantId}` : '';
@@ -791,6 +829,13 @@ app.get('/', (_req, res) => res.json({ ok: true, name: 'PUREBBLE Shopify Invento
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`PUREBBLE runner listening on ${PORT}`);
+
+  if (googleConfigured()) {
+    setTimeout(() => syncApprovalMetadata().catch(err => console.error('initial approval metadata sync failed', err)), 2000);
+    setInterval(() => syncApprovalMetadata().catch(err => console.error('scheduled approval metadata sync failed', err)), 15000);
+    console.log('CHANGE REQUEST approval metadata auto-fill enabled every 15000 ms');
+  }
+
   if (ENABLE_SHOPIFY_INVENTORY_SYNC && googleConfigured() && shopifyApiConfigured()) {
     console.log(`Inventory auto reconcile enabled every ${SYNC_INTERVAL_MS} ms`);
     setTimeout(() => reconcileInventory({ allowWrites: true }).catch(err => console.error('initial reconcile failed', err)), 5000);

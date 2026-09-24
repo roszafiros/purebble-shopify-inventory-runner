@@ -84,6 +84,15 @@ async function getValues(range) {
   return r.data.values || [];
 }
 
+async function getFormulaValues(range) {
+  const r = await getSheets().spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range,
+    valueRenderOption: 'FORMULA'
+  });
+  return r.data.values || [];
+}
+
 async function updateValues(data) {
   await getSheets().spreadsheets.values.batchUpdate({
     spreadsheetId: SPREADSHEET_ID,
@@ -156,6 +165,54 @@ async function nextEmptyRow(sheetName, column = 'A', maxRow = 1000) {
     if (!values[i] || !String(values[i][0] ?? '').trim()) return i + 2;
   }
   throw new Error(`${sheetName} has no empty rows before ${maxRow}`);
+}
+
+async function syncChangeRequestSnapshots() {
+  if (!googleConfigured()) return { checked: 0, updated: 0 };
+
+  // Rows 2:18 are historical rows already normalized manually.
+  // New requests begin at row 19 and must preserve the inventory state that existed
+  // when the SKU was entered, rather than following Product Master forever.
+  const rows = await getFormulaValues("'CHANGE REQUEST'!D19:F500");
+  const productRows = await getValues("'Product Master'!C2:G1000");
+  const productMap = new Map(
+    productRows
+      .filter(r => String(r[0] || '').trim())
+      .map(r => [String(r[0]).trim(), { storage: parseNumber(r[2]), shelf: parseNumber(r[4]) }])
+  );
+
+  const writes = [];
+  let checked = 0;
+
+  for (let i = 0; i < rows.length; i++) {
+    const rowNumber = i + 19;
+    const row = rows[i] || [];
+    const sku = String(row[0] || '').trim();
+    if (!sku) continue;
+    checked += 1;
+
+    const storageCell = row[1];
+    const shelfCell = row[2];
+    const storageIsFormula = typeof storageCell === 'string' && storageCell.startsWith('=');
+    const shelfIsFormula = typeof shelfCell === 'string' && shelfCell.startsWith('=');
+
+    if (!storageIsFormula && !shelfIsFormula) continue;
+
+    const snapshot = productMap.get(sku);
+    if (!snapshot) {
+      console.warn(`CHANGE REQUEST snapshot skipped: SKU ${sku} not found in Product Master (row ${rowNumber})`);
+      continue;
+    }
+
+    writes.push({
+      range: `'CHANGE REQUEST'!E${rowNumber}:F${rowNumber}`,
+      values: [[snapshot.storage, snapshot.shelf]]
+    });
+  }
+
+  if (writes.length) await updateValues(writes);
+  if (writes.length) console.log(`CHANGE REQUEST inventory snapshots locked: ${writes.length} row(s)`);
+  return { checked, updated: writes.length };
 }
 
 async function syncApprovalMetadata() {
@@ -832,9 +889,13 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`PUREBBLE runner listening on ${PORT}`);
 
   if (googleConfigured()) {
-    setTimeout(() => syncApprovalMetadata().catch(err => console.error('initial approval metadata sync failed', err)), 2000);
-    setInterval(() => syncApprovalMetadata().catch(err => console.error('scheduled approval metadata sync failed', err)), 15000);
-    console.log('CHANGE REQUEST approval metadata auto-fill enabled every 15000 ms');
+    const syncChangeRequests = async () => {
+      await syncChangeRequestSnapshots();
+      await syncApprovalMetadata();
+    };
+    setTimeout(() => syncChangeRequests().catch(err => console.error('initial CHANGE REQUEST sync failed', err)), 2000);
+    setInterval(() => syncChangeRequests().catch(err => console.error('scheduled CHANGE REQUEST sync failed', err)), 15000);
+    console.log('CHANGE REQUEST snapshot + approval automation enabled every 15000 ms');
   }
 
   if (ENABLE_SHOPIFY_INVENTORY_SYNC && googleConfigured() && shopifyApiConfigured()) {

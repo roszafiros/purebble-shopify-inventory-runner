@@ -1019,12 +1019,15 @@ app.listen(PORT, '0.0.0.0', () => {
       await syncApprovalMetadata();
     };
     setTimeout(() => syncChangeRequests().catch(err => console.error('initial CHANGE REQUEST sync failed', err)), 2000);
-    setInterval(() => syncChangeRequests().catch(err => console.error('scheduled CHANGE REQUEST sync failed', err)), 15000);
-    console.log('CHANGE REQUEST snapshot + approval automation enabled every 15000 ms');
+    setInterval(() => syncChangeRequests().catch(err => console.error('scheduled CHANGE REQUEST sync failed', err)), 60000);
+    console.log('CHANGE REQUEST snapshot + approval automation enabled every 60000 ms');
   }
 
   if (shopifyApiConfigured() && googleConfigured()) {
-    setTimeout(() => recoverKnownFailedBundleFulfillments().catch(err => console.error('bundle backfill startup failed', err)), 8000);
+    const recoverBundles = () => recoverKnownFailedBundleFulfillments().catch(err => console.error('bundle backfill failed', err));
+    setTimeout(recoverBundles, 12000);
+    setInterval(recoverBundles, 300000);
+    console.log('Bundle backfill recovery enabled every 300000 ms');
   }
 
   if (ENABLE_SHOPIFY_INVENTORY_SYNC && googleConfigured() && shopifyApiConfigured()) {

@@ -268,6 +268,24 @@ async function getErpSkuForVariant(variantId, fallbackSku) {
   return '';
 }
 
+async function getBundleComponents(variantId) {
+  const variantGid = variantId ? `gid://shopify/ProductVariant/${variantId}` : '';
+  if (!variantGid) return [];
+  const rows = await getValues("'SHOPIFY BUNDLE MAPPING'!A2:F200");
+  return rows
+    .filter(row =>
+      String(row[0] || '').trim() === variantGid &&
+      String(row[4] || '').trim().toLowerCase() === 'yes'
+    )
+    .map(row => ({
+      variantGid,
+      bundleTitle: String(row[1] || '').trim(),
+      sku: String(row[2] || '').trim(),
+      qtyPerBundle: parseNumber(row[3])
+    }))
+    .filter(x => x.sku && x.qtyPerBundle > 0);
+}
+
 async function getProductShelf(sku) {
   const rows = await getValues("'Product Master'!C2:G100");
   for (const row of rows) {
@@ -522,14 +540,14 @@ function shipmentReviewKey({ shipDate, orderRef, sku, qty, expiry, eventKey }) {
   return `${yyyymmdd(shipDate)}|Shopify|${orderRef}|${sku}|Q${qty}|${yyyymmdd(expiry)}|${eventKey}`;
 }
 
-async function appendShipmentSegments({ orderRef, orderGid, fulfillmentGid, lineItemGid, sku, qty, shipDate, source }) {
+async function appendShipmentSegments({ orderRef, orderGid, fulfillmentGid, lineItemGid, sku, qty, shipDate, source, eventKeyBase = '' }) {
   const shelfBeforeTotal = await getProductShelf(sku);
   if (shelfBeforeTotal < qty) throw new Error(`Shelf stock ${shelfBeforeTotal} is below fulfillment qty ${qty} for ${sku}`);
 
   const allocations = allocateFefo(await getFefoLots(sku), qty);
   const firstRow = await nextEmptyRow('Channel Shipments', 'A', 1000);
   let runningShelf = shelfBeforeTotal;
-  const baseEventKey = `${fulfillmentGid}|${lineItemGid}`;
+  const baseEventKey = eventKeyBase || `${fulfillmentGid}|${lineItemGid}`;
   const writes = [];
 
   allocations.forEach((a, index) => {
@@ -569,54 +587,136 @@ async function processFulfillment(payload) {
     if (!lineItemId || qty <= 0) continue;
 
     const lineItemGid = `gid://shopify/LineItem/${lineItemId}`;
-    const baseEventKey = `${fulfillmentGid}|${lineItemGid}`;
-    const lifecycleEventKey = `FULFILLMENTS_CREATE|${baseEventKey}`;
-
     const sku = await getErpSkuForVariant(item.variant_id, item.sku);
-    if (!sku) throw new Error(`No ERP SKU mapping for Shopify line item ${lineItemId}`);
 
-    const shipmentExists = await shipmentAlreadyHas(baseEventKey);
-    const eventExists = await orderEventAlreadyHas(lifecycleEventKey);
+    if (sku) {
+      const baseEventKey = `${fulfillmentGid}|${lineItemGid}`;
+      const lifecycleEventKey = `FULFILLMENTS_CREATE|${baseEventKey}`;
+      const shipmentExists = await shipmentAlreadyHas(baseEventKey);
+      const eventExists = await orderEventAlreadyHas(lifecycleEventKey);
 
-    if (shipmentExists) {
-      if (!eventExists) {
-        await appendOrderEvent({
-          eventAt, eventType: 'FULFILLMENTS_CREATE', orderRef, orderGid,
-          fulfillmentGid, fulfillmentLineItemGid: lineItemGid, shopifyLineItemGid: lineItemGid,
-          sku, qty, inventoryEffect: 'DEDUCT', shelfDelta: -qty,
-          reason: 'Recovered lifecycle log from existing posted shipment',
-          shopifyObjectGid: fulfillmentGid,
-          eventKey: lifecycleEventKey,
-          processStatus: 'DONE',
-          related: 'Existing Channel Shipments record',
-          notes: 'No additional Shelf deduction; shipment had already been posted.'
-        });
+      if (shipmentExists) {
+        if (!eventExists) {
+          await appendOrderEvent({
+            eventAt, eventType: 'FULFILLMENTS_CREATE', orderRef, orderGid,
+            fulfillmentGid, fulfillmentLineItemGid: lineItemGid, shopifyLineItemGid: lineItemGid,
+            sku, qty, inventoryEffect: 'DEDUCT', shelfDelta: -qty,
+            reason: 'Recovered lifecycle log from existing posted shipment',
+            shopifyObjectGid: fulfillmentGid,
+            eventKey: lifecycleEventKey,
+            processStatus: 'DONE',
+            related: 'Existing Channel Shipments record',
+            notes: 'No additional Shelf deduction; shipment had already been posted.'
+          });
+        }
+        results.push({ baseEventKey, sku, qty, status: 'duplicate_ignored_existing_shipment' });
+        continue;
       }
-      results.push({ baseEventKey, sku, qty, status: 'duplicate_ignored_existing_shipment' });
+
+      if (eventExists && !shipmentExists) {
+        throw new Error(`Lifecycle event exists without posted shipment for ${baseEventKey}; manual review required`);
+      }
+
+      const segments = await appendShipmentSegments({
+        orderRef, orderGid, fulfillmentGid, lineItemGid, sku, qty, shipDate, source
+      });
+
+      const lifecycleEvent = await appendOrderEvent({
+        eventAt, eventType: 'FULFILLMENTS_CREATE', orderRef, orderGid,
+        fulfillmentGid, fulfillmentLineItemGid: lineItemGid, shopifyLineItemGid: lineItemGid,
+        sku, qty, inventoryEffect: 'DEDUCT', shelfDelta: -qty,
+        reason: 'Actual fulfillment posted to Shelf inventory',
+        shopifyObjectGid: fulfillmentGid,
+        eventKey: lifecycleEventKey,
+        processStatus: 'DONE',
+        related: `${segments} FEFO shipment segment(s)`
+      });
+
+      postedQty += qty;
+      results.push({ baseEventKey, sku, qty, segments, lifecycleEvent, status: 'posted' });
       continue;
     }
 
-    if (eventExists && !shipmentExists) {
-      throw new Error(`Lifecycle event exists without posted shipment for ${baseEventKey}; manual review required`);
+    const components = await getBundleComponents(item.variant_id);
+    if (!components.length) throw new Error(`No ERP SKU or bundle mapping for Shopify line item ${lineItemId}`);
+
+    const bundleSummaryKey = `FULFILLMENTS_CREATE|${fulfillmentGid}|${lineItemGid}|BUNDLE_SUMMARY`;
+    let allComponentsReady = true;
+    const componentResults = [];
+
+    for (const component of components) {
+      const componentQty = qty * component.qtyPerBundle;
+      const componentBaseEventKey = `${fulfillmentGid}|${lineItemGid}|BUNDLE|${component.sku}`;
+      const componentLifecycleKey = `FULFILLMENTS_CREATE|${componentBaseEventKey}`;
+      const shipmentExists = await shipmentAlreadyHas(componentBaseEventKey);
+      const eventExists = await orderEventAlreadyHas(componentLifecycleKey);
+
+      if (shipmentExists) {
+        if (!eventExists) {
+          await appendOrderEvent({
+            eventAt, eventType: 'FULFILLMENTS_CREATE', orderRef, orderGid,
+            fulfillmentGid, fulfillmentLineItemGid: lineItemGid, shopifyLineItemGid: lineItemGid,
+            sku: component.sku, qty: componentQty, inventoryEffect: 'DEDUCT', shelfDelta: -componentQty,
+            reason: `Recovered bundle component lifecycle log for ${component.bundleTitle || 'Shopify bundle'}`,
+            shopifyObjectGid: fulfillmentGid,
+            eventKey: componentLifecycleKey,
+            processStatus: 'DONE',
+            related: 'Existing Channel Shipments bundle component',
+            notes: 'No additional Shelf deduction; bundle component shipment had already been posted.'
+          });
+        }
+        componentResults.push({ sku: component.sku, qty: componentQty, status: 'duplicate_ignored_existing_shipment' });
+        continue;
+      }
+
+      if (eventExists && !shipmentExists) {
+        allComponentsReady = false;
+        throw new Error(`Bundle component lifecycle event exists without posted shipment for ${componentBaseEventKey}; manual review required`);
+      }
+
+      const segments = await appendShipmentSegments({
+        orderRef, orderGid, fulfillmentGid, lineItemGid,
+        sku: component.sku, qty: componentQty, shipDate, source: 'Shopify Bundle Webhook',
+        eventKeyBase: componentBaseEventKey
+      });
+
+      const lifecycleEvent = await appendOrderEvent({
+        eventAt, eventType: 'FULFILLMENTS_CREATE', orderRef, orderGid,
+        fulfillmentGid, fulfillmentLineItemGid: lineItemGid, shopifyLineItemGid: lineItemGid,
+        sku: component.sku, qty: componentQty, inventoryEffect: 'DEDUCT', shelfDelta: -componentQty,
+        reason: `Bundle component fulfilled from ${component.bundleTitle || 'Shopify bundle'}`,
+        shopifyObjectGid: fulfillmentGid,
+        eventKey: componentLifecycleKey,
+        processStatus: 'DONE',
+        related: `${segments} FEFO shipment segment(s)`,
+        notes: `Bundle quantity ${qty}; component quantity per bundle ${component.qtyPerBundle}`
+      });
+
+      componentResults.push({ sku: component.sku, qty: componentQty, segments, lifecycleEvent, status: 'posted' });
     }
 
-    const segments = await appendShipmentSegments({
-      orderRef, orderGid, fulfillmentGid, lineItemGid, sku, qty, shipDate, source
-    });
+    if (allComponentsReady && !(await orderEventAlreadyHas(bundleSummaryKey))) {
+      await appendOrderEvent({
+        eventAt, eventType: 'FULFILLMENTS_CREATE', orderRef, orderGid,
+        fulfillmentGid, fulfillmentLineItemGid: lineItemGid, shopifyLineItemGid: lineItemGid,
+        sku: '', qty, inventoryEffect: 'NONE', shelfDelta: 0,
+        reason: `Bundle fulfillment fully decomposed into ${components.length} ERP components`,
+        shopifyObjectGid: fulfillmentGid,
+        eventKey: bundleSummaryKey,
+        processStatus: 'DONE',
+        related: components.map(c => `${c.sku} x${c.qtyPerBundle}`).join(', '),
+        notes: 'Order fulfilled quantity is counted once at bundle level; component deductions are logged separately.'
+      });
+      postedQty += qty;
+    }
 
-    const lifecycleEvent = await appendOrderEvent({
-      eventAt, eventType: 'FULFILLMENTS_CREATE', orderRef, orderGid,
-      fulfillmentGid, fulfillmentLineItemGid: lineItemGid, shopifyLineItemGid: lineItemGid,
-      sku, qty, inventoryEffect: 'DEDUCT', shelfDelta: -qty,
-      reason: 'Actual fulfillment posted to Shelf inventory',
-      shopifyObjectGid: fulfillmentGid,
-      eventKey: lifecycleEventKey,
-      processStatus: 'DONE',
-      related: `${segments} FEFO shipment segment(s)`
+    results.push({
+      lineItemGid,
+      bundle: components[0]?.bundleTitle || item.title || 'Shopify bundle',
+      qty,
+      components: componentResults,
+      status: 'bundle_processed'
     });
-
-    postedQty += qty;
-    results.push({ baseEventKey, sku, qty, segments, lifecycleEvent, status: 'posted' });
   }
 
   if (postedQty > 0) {

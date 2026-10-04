@@ -734,31 +734,6 @@ async function processFulfillment(payload) {
   return results;
 }
 
-async function fetchOrderFulfillmentsRest(orderId) {
-  const response = await fetch(`https://${SHOPIFY_STORE_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}/orders/${orderId}/fulfillments.json`, {
-    headers: { 'X-Shopify-Access-Token': SHOPIFY_ADMIN_ACCESS_TOKEN }
-  });
-  const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(`Shopify fulfillment backfill HTTP ${response.status}: ${JSON.stringify(body)}`);
-  return Array.isArray(body.fulfillments) ? body.fulfillments : [];
-}
-
-async function recoverKnownFailedBundleFulfillments() {
-  if (!shopifyApiConfigured() || !googleConfigured()) return;
-  const orderIds = ['6972267724871', '6973638049863'];
-  for (const orderId of orderIds) {
-    try {
-      const fulfillments = await fetchOrderFulfillmentsRest(orderId);
-      for (const fulfillment of fulfillments) {
-        const results = await processFulfillment(fulfillment);
-        console.log(`Bundle backfill order ${orderId} fulfillment ${fulfillment.id}: ${JSON.stringify(results)}`);
-      }
-    } catch (err) {
-      console.error(`Bundle backfill failed for order ${orderId}`, err);
-    }
-  }
-}
-
 async function shopifyGraphQL(query, variables = {}) {
   if (!shopifyApiConfigured()) throw new Error('Shopify Admin API credentials are not configured');
   const response = await fetch(`https://${SHOPIFY_STORE_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`, {
@@ -1021,13 +996,6 @@ app.listen(PORT, '0.0.0.0', () => {
     setTimeout(() => syncChangeRequests().catch(err => console.error('initial CHANGE REQUEST sync failed', err)), 2000);
     setInterval(() => syncChangeRequests().catch(err => console.error('scheduled CHANGE REQUEST sync failed', err)), 60000);
     console.log('CHANGE REQUEST snapshot + approval automation enabled every 60000 ms');
-  }
-
-  if (shopifyApiConfigured() && googleConfigured()) {
-    const recoverBundles = () => recoverKnownFailedBundleFulfillments().catch(err => console.error('bundle backfill failed', err));
-    setTimeout(recoverBundles, 12000);
-    setInterval(recoverBundles, 300000);
-    console.log('Bundle backfill recovery enabled every 300000 ms');
   }
 
   if (ENABLE_SHOPIFY_INVENTORY_SYNC && googleConfigured() && shopifyApiConfigured()) {

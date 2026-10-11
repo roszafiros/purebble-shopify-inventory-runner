@@ -11,7 +11,8 @@ const SHOPIFY_STORE_DOMAIN = String(process.env.SHOPIFY_STORE_DOMAIN || '').repl
 const SHOPIFY_ADMIN_ACCESS_TOKEN = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN || '';
 const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || '2026-07';
 const ENABLE_SHOPIFY_INVENTORY_SYNC = String(process.env.ENABLE_SHOPIFY_INVENTORY_SYNC || '').toLowerCase() === 'true';
-const SYNC_INTERVAL_MS = Math.max(60000, Number(process.env.SYNC_INTERVAL_MS || 60000));
+const SYNC_INTERVAL_MS = Math.max(300000, Number(process.env.SYNC_INTERVAL_MS || 300000));
+const CHANGE_REQUEST_SYNC_INTERVAL_MS = 180000;
 
 app.use(express.json({
   limit: '2mb',
@@ -20,6 +21,7 @@ app.use(express.json({
 
 let sheetsClient;
 let reconcileRunning = false;
+let changeRequestSyncRunning = false;
 
 function googleConfigured() {
   return Boolean(process.env.GOOGLE_SERVICE_ACCOUNT_JSON || (process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL && process.env.GOOGLE_PRIVATE_KEY));
@@ -990,17 +992,28 @@ app.listen(PORT, '0.0.0.0', () => {
 
   if (googleConfigured()) {
     const syncChangeRequests = async () => {
-      await syncChangeRequestSnapshots();
-      await syncApprovalMetadata();
+      if (changeRequestSyncRunning) {
+        console.log('CHANGE REQUEST sync skipped: previous run still active');
+        return;
+      }
+      changeRequestSyncRunning = true;
+      try {
+        await syncChangeRequestSnapshots();
+        await syncApprovalMetadata();
+      } finally {
+        changeRequestSyncRunning = false;
+      }
     };
-    setTimeout(() => syncChangeRequests().catch(err => console.error('initial CHANGE REQUEST sync failed', err)), 2000);
-    setInterval(() => syncChangeRequests().catch(err => console.error('scheduled CHANGE REQUEST sync failed', err)), 60000);
-    console.log('CHANGE REQUEST snapshot + approval automation enabled every 60000 ms');
+    // Stagger background work so Google Sheets and Shopify reconciliation do not start together.
+    setTimeout(() => syncChangeRequests().catch(err => console.error('initial CHANGE REQUEST sync failed', err)), 15000);
+    setInterval(() => syncChangeRequests().catch(err => console.error('scheduled CHANGE REQUEST sync failed', err)), CHANGE_REQUEST_SYNC_INTERVAL_MS);
+    console.log(`CHANGE REQUEST snapshot + approval automation enabled every ${CHANGE_REQUEST_SYNC_INTERVAL_MS} ms`);
   }
 
   if (ENABLE_SHOPIFY_INVENTORY_SYNC && googleConfigured() && shopifyApiConfigured()) {
     console.log(`Inventory auto reconcile enabled every ${SYNC_INTERVAL_MS} ms`);
-    setTimeout(() => reconcileInventory({ allowWrites: true }).catch(err => console.error('initial reconcile failed', err)), 5000);
+    // Keep inventory reconciliation separated from CHANGE REQUEST work.
+    setTimeout(() => reconcileInventory({ allowWrites: true }).catch(err => console.error('initial reconcile failed', err)), 90000);
     setInterval(() => reconcileInventory({ allowWrites: true }).catch(err => console.error('scheduled reconcile failed', err)), SYNC_INTERVAL_MS);
   } else {
     console.log('Inventory auto reconcile disabled until credentials and ENABLE_SHOPIFY_INVENTORY_SYNC=true are configured');

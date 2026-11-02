@@ -255,6 +255,56 @@ async function syncApprovalMetadata() {
   return { checked, updated: writes.length };
 }
 
+
+async function syncInboundApprovalMetadata() {
+  if (!googleConfigured()) return { checked: 0, updated: 0 };
+
+  const rows = await getValues("'INBOUND CONTROL'!D2:V500");
+  const writes = [];
+  let checked = 0;
+
+  for (let i = 0; i < rows.length; i++) {
+    const rowNumber = i + 2;
+    const row = rows[i] || [];
+    const sku = String(row[0] || '').trim();          // D
+    if (!sku) continue;
+    checked += 1;
+
+    const receivedBoxes = parseNumber(row[5]);        // I
+    const expirationDate = String(row[9] || '').trim(); // M
+    const receiptApproval = String(row[10] || '').trim(); // N
+    const approvedBy = String(row[11] || '').trim();  // O
+    const approvalDate = String(row[12] || '').trim();// P
+    const decision = String(row[16] || '').trim();    // T
+    const reviewKey = String(row[17] || '').trim();   // U
+    const finalKey = String(row[18] || '').trim();    // V
+
+    if (decision !== 'Approved') continue;
+
+    // Never complete receipt approval until physical receipt data is present.
+    if (receivedBoxes <= 0 || !expirationDate) continue;
+
+    // Final confirmation follows the reviewed snapshot.
+    if (reviewKey && !finalKey) {
+      writes.push({ range: `'INBOUND CONTROL'!V${rowNumber}`, values: [[reviewKey]] });
+    }
+
+    const finalWillMatch = reviewKey && (!finalKey || finalKey === reviewKey);
+    if (!finalWillMatch) continue;
+
+    if (!approvedBy) {
+      writes.push({ range: `'INBOUND CONTROL'!O${rowNumber}`, values: [['Jean']] });
+    }
+    if (!approvalDate) {
+      writes.push({ range: `'INBOUND CONTROL'!P${rowNumber}`, values: [[todayPacificDate()]] });
+    }
+  }
+
+  if (writes.length) await updateValues(writes);
+  if (writes.length) console.log(`INBOUND CONTROL approval metadata auto-filled: ${writes.length} cell(s)`);
+  return { checked, updated: writes.length };
+}
+
 async function getErpSkuForVariant(variantId, fallbackSku) {
   const rows = await getValues("'SHOPIFY SYNC'!B2:F37");
   const variantGid = variantId ? `gid://shopify/ProductVariant/${variantId}` : '';
@@ -1000,6 +1050,7 @@ app.listen(PORT, '0.0.0.0', () => {
       try {
         await syncChangeRequestSnapshots();
         await syncApprovalMetadata();
+        await syncInboundApprovalMetadata();
       } finally {
         changeRequestSyncRunning = false;
       }

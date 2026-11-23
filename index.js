@@ -6,10 +6,13 @@ const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const SPREADSHEET_ID = process.env.GOOGLE_SPREADSHEET_ID || '';
 const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || '';
-const SHOPIFY_WEBHOOK_HMAC_SECRET = process.env.SHOPIFY_WEBHOOK_HMAC_SECRET || '';
 const SHOPIFY_STORE_DOMAIN = String(process.env.SHOPIFY_STORE_DOMAIN || '').replace(/^https?:\/\//, '').replace(/\/$/, '');
-const SHOPIFY_ADMIN_ACCESS_TOKEN = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN || '';
+const SHOPIFY_CLIENT_ID = process.env.SHOPIFY_CLIENT_ID || '';
+const SHOPIFY_CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET || '';
+const SHOPIFY_WEBHOOK_HMAC_SECRET = process.env.SHOPIFY_WEBHOOK_HMAC_SECRET || SHOPIFY_CLIENT_SECRET;
+let SHOPIFY_ADMIN_ACCESS_TOKEN = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN || '';
 const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || '2026-07';
+const SHOPIFY_TOKEN_REFRESH_MS = 20 * 60 * 60 * 1000;
 const ENABLE_SHOPIFY_INVENTORY_SYNC = String(process.env.ENABLE_SHOPIFY_INVENTORY_SYNC || '').toLowerCase() === 'true';
 const SYNC_INTERVAL_MS = Math.max(300000, Number(process.env.SYNC_INTERVAL_MS || 300000));
 const CHANGE_REQUEST_SYNC_INTERVAL_MS = 180000;
@@ -28,7 +31,48 @@ function googleConfigured() {
 }
 
 function shopifyApiConfigured() {
-  return Boolean(SHOPIFY_STORE_DOMAIN && SHOPIFY_ADMIN_ACCESS_TOKEN);
+  return Boolean(
+    SHOPIFY_STORE_DOMAIN &&
+    (SHOPIFY_ADMIN_ACCESS_TOKEN || (SHOPIFY_CLIENT_ID && SHOPIFY_CLIENT_SECRET))
+  );
+}
+
+function logMemory(label) {
+  const m = process.memoryUsage();
+  const mb = n => Math.round(n / 1024 / 1024);
+  console.log(
+    `MEMORY ${label} rss=${mb(m.rss)}MB heapUsed=${mb(m.heapUsed)}MB heapTotal=${mb(m.heapTotal)}MB external=${mb(m.external)}MB`
+  );
+}
+
+async function refreshShopifyAccessToken(reason = 'scheduled') {
+  if (!SHOPIFY_STORE_DOMAIN || !SHOPIFY_CLIENT_ID || !SHOPIFY_CLIENT_SECRET) {
+    if (SHOPIFY_ADMIN_ACCESS_TOKEN) return SHOPIFY_ADMIN_ACCESS_TOKEN;
+    throw new Error('Shopify client credentials are not configured');
+  }
+
+  const response = await fetch(`https://${SHOPIFY_STORE_DOMAIN}/admin/oauth/access_token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      grant_type: 'client_credentials',
+      client_id: SHOPIFY_CLIENT_ID,
+      client_secret: SHOPIFY_CLIENT_SECRET
+    })
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok || !body.access_token) {
+    throw new Error(`Shopify token request failed (${response.status}): ${JSON.stringify(body)}`);
+  }
+
+  SHOPIFY_ADMIN_ACCESS_TOKEN = body.access_token;
+  console.log(`Shopify access token refreshed in-process; reason=${reason}; expiresIn=${Number(body.expires_in || 86400)}s`);
+  return SHOPIFY_ADMIN_ACCESS_TOKEN;
+}
+
+async function ensureShopifyAccessToken() {
+  if (SHOPIFY_ADMIN_ACCESS_TOKEN) return SHOPIFY_ADMIN_ACCESS_TOKEN;
+  return refreshShopifyAccessToken('startup');
 }
 
 function getSheets() {
@@ -786,8 +830,10 @@ async function processFulfillment(payload) {
   return results;
 }
 
-async function shopifyGraphQL(query, variables = {}) {
+async function shopifyGraphQL(query, variables = {}, retry401 = true) {
   if (!shopifyApiConfigured()) throw new Error('Shopify Admin API credentials are not configured');
+  await ensureShopifyAccessToken();
+
   const response = await fetch(`https://${SHOPIFY_STORE_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`, {
     method: 'POST',
     headers: {
@@ -796,10 +842,75 @@ async function shopifyGraphQL(query, variables = {}) {
     },
     body: JSON.stringify({ query, variables })
   });
+
   const body = await response.json().catch(() => ({}));
+  if (response.status === 401 && retry401 && SHOPIFY_CLIENT_ID && SHOPIFY_CLIENT_SECRET) {
+    console.warn('Shopify Admin API returned 401; refreshing token in-process and retrying once');
+    await refreshShopifyAccessToken('401-retry');
+    return shopifyGraphQL(query, variables, false);
+  }
   if (!response.ok) throw new Error(`Shopify Admin API HTTP ${response.status}: ${JSON.stringify(body)}`);
   if (body.errors?.length) throw new Error(`Shopify GraphQL error: ${JSON.stringify(body.errors)}`);
   return body.data;
+}
+
+
+const LIFECYCLE_WEBHOOKS = [
+  { topic: 'FULFILLMENTS_CREATE', path: '/webhooks/shopify/fulfillments-create' },
+  { topic: 'ORDERS_CREATE', path: '/webhooks/shopify/orders-create' },
+  { topic: 'ORDERS_CANCELLED', path: '/webhooks/shopify/orders-cancelled' },
+  { topic: 'REFUNDS_CREATE', path: '/webhooks/shopify/refunds-create' }
+];
+
+async function ensureLifecycleWebhooks() {
+  if (!process.env.RAILWAY_PUBLIC_DOMAIN) {
+    console.warn('RAILWAY_PUBLIC_DOMAIN missing; skipping lifecycle webhook verification');
+    return;
+  }
+
+  const host = String(process.env.RAILWAY_PUBLIC_DOMAIN).replace(/^https?:\/\//, '').replace(/\/$/, '');
+  const listQuery = `
+    query PurebbleWebhookSubscriptions($topics: [WebhookSubscriptionTopic!]) {
+      webhookSubscriptions(first: 100, topics: $topics) {
+        nodes { id topic uri format }
+      }
+    }
+  `;
+  const createMutation = `
+    mutation CreatePurebbleWebhook($topic: WebhookSubscriptionTopic!, $webhookSubscription: WebhookSubscriptionInput!) {
+      webhookSubscriptionCreate(topic: $topic, webhookSubscription: $webhookSubscription) {
+        webhookSubscription { id topic uri format }
+        userErrors { field message }
+      }
+    }
+  `;
+
+  const topics = LIFECYCLE_WEBHOOKS.map(x => x.topic);
+  let listed = await shopifyGraphQL(listQuery, { topics });
+  let nodes = listed?.webhookSubscriptions?.nodes || [];
+
+  for (const target of LIFECYCLE_WEBHOOKS) {
+    const uri = `https://${host}${target.path}`;
+    const existing = nodes.find(x => x.topic === target.topic && x.uri === uri);
+    if (existing) {
+      console.log(`WEBHOOK_VERIFY OK existing id=${existing.id} topic=${existing.topic}`);
+      continue;
+    }
+
+    const created = await shopifyGraphQL(createMutation, {
+      topic: target.topic,
+      webhookSubscription: { uri, format: 'JSON' }
+    });
+    const result = created?.webhookSubscriptionCreate;
+    if (result?.userErrors?.length) {
+      throw new Error(`Webhook create failed for ${target.topic}: ${result.userErrors.map(e => e.message).join('; ')}`);
+    }
+    if (!result?.webhookSubscription?.id) throw new Error(`Webhook create returned no subscription for ${target.topic}`);
+    console.log(`WEBHOOK_CREATE OK id=${result.webhookSubscription.id} topic=${target.topic}`);
+
+    listed = await shopifyGraphQL(listQuery, { topics });
+    nodes = listed?.webhookSubscriptions?.nodes || [];
+  }
 }
 
 const INVENTORY_READ_QUERY = `
@@ -866,6 +977,7 @@ async function setShopifyAvailable({ sku, inventoryItemId, locationId, currentAv
 async function reconcileInventory({ allowWrites = false, source = 'Scheduled Reconcile' } = {}) {
   if (reconcileRunning) return { skipped: true, reason: 'reconcile already running' };
   reconcileRunning = true;
+  logMemory('before-inventory-reconcile');
   try {
     if (!googleConfigured()) throw new Error('Google service-account credentials are not configured');
     if (!shopifyApiConfigured()) throw new Error('Shopify Admin API credentials are not configured');
@@ -966,6 +1078,7 @@ async function reconcileInventory({ allowWrites = false, source = 'Scheduled Rec
     return summary;
   } finally {
     reconcileRunning = false;
+    logMemory('after-inventory-reconcile');
   }
 }
 
@@ -1037,7 +1150,17 @@ app.post('/admin/reconcile', async (req, res) => {
 
 app.get('/', (_req, res) => res.json({ ok: true, name: 'PUREBBLE Shopify Inventory Runner' }));
 
-app.listen(PORT, '0.0.0.0', () => {
+async function bootstrap() {
+  if (shopifyApiConfigured()) {
+    await ensureShopifyAccessToken();
+    await ensureLifecycleWebhooks();
+    setInterval(() => {
+      refreshShopifyAccessToken('scheduled').catch(err => console.error('scheduled Shopify token refresh failed', err));
+    }, SHOPIFY_TOKEN_REFRESH_MS);
+  }
+  logMemory('bootstrap-ready');
+
+  app.listen(PORT, '0.0.0.0', () => {
   console.log(`PUREBBLE runner listening on ${PORT}`);
 
   if (googleConfigured()) {
@@ -1047,12 +1170,14 @@ app.listen(PORT, '0.0.0.0', () => {
         return;
       }
       changeRequestSyncRunning = true;
+      logMemory('before-change-sync');
       try {
         await syncChangeRequestSnapshots();
         await syncApprovalMetadata();
         await syncInboundApprovalMetadata();
       } finally {
         changeRequestSyncRunning = false;
+        logMemory('after-change-sync');
       }
     };
     // Stagger background work so Google Sheets and Shopify reconciliation do not start together.
@@ -1069,4 +1194,10 @@ app.listen(PORT, '0.0.0.0', () => {
   } else {
     console.log('Inventory auto reconcile disabled until credentials and ENABLE_SHOPIFY_INVENTORY_SYNC=true are configured');
   }
+  });
+}
+
+bootstrap().catch(err => {
+  console.error('BOOTSTRAP_FATAL', err?.stack || err);
+  process.exit(1);
 });
